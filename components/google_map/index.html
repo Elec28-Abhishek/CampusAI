@@ -1,0 +1,381 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    :root { color-scheme: light; font: 14px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    * { box-sizing: border-box; }
+    body { margin: 0; color: #172033; }
+    #frame { border: 1px solid #d9dee8; border-radius: 12px; overflow: hidden; background: #fff; }
+    #toolbar { display: flex; gap: 8px; padding: 10px; align-items: center; border-bottom: 1px solid #e6e9ef; flex-wrap: wrap; }
+    #query { flex: 1 1 280px; min-width: 180px; height: 38px; border: 1px solid #bbc3d1; border-radius: 7px; padding: 0 10px; font: inherit; }
+    button { height: 36px; padding: 0 12px; border: 1px solid #c6ccd7; border-radius: 7px; background: #fff; color: #182230; cursor: pointer; font: inherit; }
+    button:hover { background: #f2f5fa; }
+    button.primary { background: #1264d8; border-color: #1264d8; color: #fff; }
+    button:disabled { opacity: .55; cursor: default; }
+    #map { width: 100%; height: 570px; background: #edf1f5; }
+    #status { min-height: 24px; padding: 5px 12px; color: #475569; font-size: 12px; }
+    #results { display: flex; flex-wrap: wrap; gap: 6px; padding: 0 10px 10px; }
+    .place-result { height: auto; min-height: 34px; max-width: 100%; text-align: left; white-space: normal; font-size: 12px; }
+    #legend { display: flex; flex-wrap: wrap; gap: 12px; padding: 2px 12px 8px; color: #475569; font-size: 12px; }
+    .legend-item { display: inline-flex; gap: 6px; align-items: center; }
+    .swatch { display: inline-block; width: 14px; height: 4px; border-radius: 4px; }
+    #directions { border-top: 1px solid #e6e9ef; padding: 8px 12px 10px; }
+    #directions:empty { display: none; }
+    #steps { margin: 5px 0 0; padding-left: 22px; color: #475569; font-size: 12px; }
+    .muted { color: #64748b; }
+  </style>
+</head>
+<body>
+  <div id="frame">
+    <div id="toolbar">
+      <input id="query" aria-label="Search VSSUT campus places" placeholder="Search a building or facility at VSSUT" />
+      <button id="search" class="primary">Search campus places</button>
+    </div>
+    <div id="status" role="status">Loading Google Maps…</div>
+    <div id="results"></div>
+    <div id="map" aria-label="Interactive Google Map of VSSUT"></div>
+    <div id="legend"></div>
+    <div id="directions"></div>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    let args = {};
+    let map = null;
+    let PlaceClass = null;
+    let RouteClass = null;
+    let infoWindow = null;
+    let markers = [];
+    let localPolylines = [];
+    let googleRoutePolylines = [];
+    let searchPlaces = [];
+    let routeCache = new Map();
+    let routeInFlight = new Set();
+    let sentRouteEvents = new Set();
+    let mapsPromise = null;
+    let mapsErrorSent = false;
+    let boundaryPolygons = [];
+
+    function componentMessage(type, payload = {}) {
+      const value = { type, ...payload, event_id: `${Date.now()}-${Math.random().toString(36).slice(2)}` };
+      window.parent.postMessage({ isStreamlitMessage: true, type: "streamlit:setComponentValue", value }, "*");
+    }
+    function resizeFrame() {
+      window.parent.postMessage({ isStreamlitMessage: true, type: "streamlit:setFrameHeight", height: document.body.scrollHeight }, "*");
+    }
+    function setStatus(message) { $("status").textContent = message || ""; }
+    function clearItems(items) { for (const item of items) item.setMap(null); items.length = 0; }
+    function latLngLiteral(location) {
+      if (!location) return null;
+      const lat = typeof location.lat === "function" ? location.lat() : location.lat;
+      const lng = typeof location.lng === "function" ? location.lng() : location.lng;
+      return Number.isFinite(lat) && Number.isFinite(lng) ? { lat, lng } : null;
+    }
+    function safeText(value) { return String(value || "").replace(/[&<>"']/g, (char) => ({"&":"&amp;", "<":"&lt;", ">":"&gt;", "\"":"&quot;", "'":"&#39;"}[char])); }
+
+    function loadMapsApi(apiKey) {
+      if (window.google && window.google.maps) return Promise.resolve();
+      if (mapsPromise) return mapsPromise;
+      mapsPromise = new Promise((resolve, reject) => {
+        window.gm_authFailure = () => {
+          const message = "Google Maps rejected this API key. Check API enablement, billing, and application/API restrictions.";
+          reject(new Error(message));
+          if (!mapsErrorSent) {
+            mapsErrorSent = true;
+            componentMessage("maps_error", { message });
+          }
+        };
+        window.__campusMapReady = resolve;
+        const script = document.createElement("script");
+        script.src = `https://maps.googleapis.com/maps/api/js?key=${encodeURIComponent(apiKey)}&loading=async&callback=__campusMapReady&v=weekly`;
+        script.async = true;
+        script.onerror = () => reject(new Error("Google Maps JavaScript API could not be loaded. Check the network and API key."));
+        document.head.appendChild(script);
+      });
+      return mapsPromise;
+    }
+
+    async function initializeMap() {
+      const [{ Map, InfoWindow, Marker, Polyline, Polygon }, { Place }, { Route }] = await Promise.all([
+        google.maps.importLibrary("maps"),
+        google.maps.importLibrary("places"),
+        google.maps.importLibrary("routes")
+      ]);
+      PlaceClass = Place;
+      RouteClass = Route;
+      const viewport = args.viewport || { latitude: 21.496210992454685, longitude: 83.90458072786595, zoom: 17 };
+      map = new Map($("map"), {
+        center: { lat: viewport.latitude, lng: viewport.longitude },
+        zoom: viewport.zoom,
+        mapTypeId: "roadmap",
+        mapTypeControl: true,
+        mapTypeControlOptions: { style: google.maps.MapTypeControlStyle.DROPDOWN_MENU, mapTypeIds: ["roadmap", "satellite"] },
+        fullscreenControl: true,
+        streetViewControl: false,
+        clickableIcons: false
+      });
+      infoWindow = new InfoWindow();
+      map.addListener("click", (event) => {
+        if (!event.latLng) return;
+        const point = latLngLiteral(event.latLng);
+        componentMessage("map_click", point);
+      });
+      window.__campusMarkerClass = Marker;
+      window.__campusPolylineClass = Polyline;
+      window.__campusPolygonClass = Polygon;
+      await renderMapContent();
+      setStatus("Google Maps · VSSUT campus · switch between Map and Satellite using the map controls.");
+    }
+
+    function addMarker(position, title, html, onSelect) {
+      const Marker = window.__campusMarkerClass;
+      const marker = new Marker({ map, position, title, optimized: true });
+      marker.addListener("click", () => {
+        infoWindow.setContent(html);
+        infoWindow.open({ map, anchor: marker });
+        if (onSelect) onSelect();
+      });
+      markers.push(marker);
+      return marker;
+    }
+
+    async function renderMapContent() {
+      if (!map) return;
+      clearItems(markers);
+      clearItems(localPolylines);
+      clearItems(boundaryPolygons);
+      if (args.map_click) {
+        const point = { lat: args.map_click.latitude, lng: args.map_click.longitude };
+        addMarker(point, "Selected map point", `<strong>Selected map point</strong><br>${point.lat.toFixed(6)}, ${point.lng.toFixed(6)}`);
+      }
+      for (const building of (args.buildings || [])) {
+        if (!Number.isFinite(building.latitude) || !Number.isFinite(building.longitude)) continue;
+        const position = { lat: building.latitude, lng: building.longitude };
+        const source = building.coordinates_verified ? "Verified location" : "Unverified location";
+        addMarker(position, building.name, `<strong>${safeText(building.name)}</strong><br>${safeText(building.info)}<br><span class="muted">${source}</span>`);
+      }
+      for (const place of (args.discovered_places || [])) {
+        if (!Number.isFinite(place.latitude) || !Number.isFinite(place.longitude)) continue;
+        const position = { lat: place.latitude, lng: place.longitude };
+        addMarker(position, place.name, `<strong>${safeText(place.name)}</strong><br>${safeText(place.address)}<br><span class="muted">Google Places result</span>`, () => componentMessage("place_selected", { place }));
+      }
+      if (args.boundary && args.boundary.length >= 3) {
+        const Polygon = window.__campusPolygonClass;
+        boundaryPolygons.push(new Polygon({ map, paths: args.boundary.map((point) => ({ lat: point.latitude, lng: point.longitude })), strokeColor: "#1264d8", strokeOpacity: .9, strokeWeight: 2, fillColor: "#1264d8", fillOpacity: .12 }));
+      }
+      const palette = ["#7c3aed", "#e11d48", "#0891b2"];
+      for (const [index, route of (args.algorithm_routes || []).entries()) {
+        if (!route.coordinates || route.coordinates.length < 2) continue;
+        const Polyline = window.__campusPolylineClass;
+        localPolylines.push(new Polyline({ map, path: route.coordinates.map((point) => ({ lat: point.latitude, lng: point.longitude })), geodesic: true, strokeColor: palette[index % palette.length], strokeOpacity: .85, strokeWeight: 5, zIndex: 2 }));
+      }
+      await computeGoogleRoute();
+      renderLegend();
+      renderSearchResults();
+      resizeFrame();
+    }
+
+    function toPlaceResult(place) {
+      const point = latLngLiteral(place.location);
+      if (!point || !place.id || !place.displayName) return null;
+      return {
+        id: place.id,
+        name: typeof place.displayName === "string" ? place.displayName : place.displayName.text,
+        latitude: point.lat,
+        longitude: point.lng,
+        address: place.formattedAddress || "",
+        types: place.types || [],
+        google_maps_url: place.googleMapsURI || ""
+      };
+    }
+    function renderSearchResults() {
+      const container = $("results");
+      container.replaceChildren();
+      for (const place of searchPlaces) {
+        const button = document.createElement("button");
+        button.className = "place-result";
+        button.textContent = `${place.name}${place.address ? " · " + place.address : ""}`;
+        button.title = "Select this Google Places result";
+        button.addEventListener("click", () => {
+          map.panTo({ lat: place.latitude, lng: place.longitude });
+          map.setZoom(Math.max(map.getZoom() || 16, 17));
+          componentMessage("place_selected", { place });
+        });
+        container.appendChild(button);
+      }
+      resizeFrame();
+    }
+
+    async function searchPlaces() {
+      const query = $("query").value.trim();
+      if (!query || !PlaceClass) return;
+      const button = $("search");
+      button.disabled = true;
+      setStatus(`Searching Google Places for “${query}” near VSSUT…`);
+      try {
+        const { places = [] } = await PlaceClass.searchByText({
+          textQuery: `${query} VSSUT Burla Odisha India`,
+          fields: ["id", "displayName", "location", "formattedAddress", "types", "googleMapsURI"],
+          locationBias: { center: map.getCenter(), radius: 4000 },
+          language: "en-IN",
+          region: "IN",
+          maxResultCount: 10
+        });
+        searchPlaces = places.map(toPlaceResult).filter(Boolean);
+        await renderMapContent();
+        setStatus(searchPlaces.length ? `${searchPlaces.length} Google Places result(s). Select one below or click its map marker.` : "Google Places returned no matching places. Try a shorter building name or ask an administrator to verify its pin.");
+        componentMessage("search_results", { query, places: searchPlaces });
+      } catch (error) {
+        setStatus(`Google Places search failed: ${error.message || "Check the Places API configuration."}`);
+        componentMessage("places_error", { message: error.message || "Google Places search failed." });
+      } finally {
+        button.disabled = false;
+        resizeFrame();
+      }
+    }
+
+    function routeSignature(origin, destination) {
+      if (!origin || !destination) return "";
+      return [origin.place_id || origin.id || `${origin.latitude},${origin.longitude}`, destination.place_id || destination.id || `${destination.latitude},${destination.longitude}`].join("|");
+    }
+    async function computeGoogleRoute() {
+      const origin = args.origin;
+      const destination = args.destination;
+      const signature = routeSignature(origin, destination);
+      if (!signature || !Number.isFinite(origin.latitude) || !Number.isFinite(destination.latitude)) {
+        clearItems(googleRoutePolylines);
+        $("directions").replaceChildren();
+        return;
+      }
+      if (routeCache.has(signature)) {
+        drawCachedRoute(signature, routeCache.get(signature));
+        return;
+      }
+      if (routeInFlight.has(signature)) return;
+      clearItems(googleRoutePolylines);
+      routeInFlight.add(signature);
+      setStatus("Requesting a Google walking route…");
+      try {
+        const originPoint = { lat: origin.latitude, lng: origin.longitude };
+        const destinationPoint = { lat: destination.latitude, lng: destination.longitude };
+        const request = {
+          origin: origin.place_id ? new PlaceClass({ id: origin.place_id }) : originPoint,
+          destination: destination.place_id ? new PlaceClass({ id: destination.place_id }) : destinationPoint,
+          travelMode: "WALKING",
+          fields: ["path", "distanceMeters", "durationMillis", "legs"]
+        };
+        const { routes = [] } = await RouteClass.computeRoutes(request);
+        if (!routes.length) throw new Error("Google Routes API returned no walking route for these points.");
+        const route = routes[0];
+        const path = (route.path || []).map(latLngLiteral).filter(Boolean);
+        const event = {
+          type: "google_route",
+          signature,
+          distance_m: route.distanceMeters || 0,
+          duration_ms: route.durationMillis || 0,
+          path,
+          steps: (route.legs || []).flatMap((leg) => leg.steps || []).map((step) => step.instructions).filter(Boolean)
+        };
+        routeCache.set(signature, event);
+        drawCachedRoute(signature, event);
+        if (!sentRouteEvents.has(signature)) {
+          sentRouteEvents.add(signature);
+          componentMessage("google_route", { route: event });
+        }
+        setStatus("Google walking directions returned for the selected origin and destination.");
+      } catch (error) {
+        const event = { type: "google_route_error", signature, message: error.message || "Google Routes API request failed." };
+        routeCache.set(signature, event);
+        clearItems(googleRoutePolylines);
+        showRouteSummary(event);
+        if (!sentRouteEvents.has(signature)) {
+          sentRouteEvents.add(signature);
+          componentMessage("google_route_error", { route: event });
+        }
+        setStatus(`${event.message} Check Routes API enablement, billing, and key restrictions.`);
+      } finally {
+        routeInFlight.delete(signature);
+      }
+    }
+    function drawCachedRoute(signature, route) {
+      clearItems(googleRoutePolylines);
+      if (route.type === "google_route" && route.path.length >= 2) {
+        const Polyline = window.__campusPolylineClass;
+        googleRoutePolylines.push(new Polyline({ map, path: route.path, geodesic: true, strokeColor: "#1264d8", strokeOpacity: 1, strokeWeight: 7, zIndex: 5 }));
+        const bounds = new google.maps.LatLngBounds();
+        route.path.forEach((point) => bounds.extend(point));
+        map.fitBounds(bounds, 72);
+      }
+      showRouteSummary(route);
+      renderLegend();
+    }
+    function renderLegend() {
+      const legend = $("legend");
+      legend.replaceChildren();
+      const palette = ["#7c3aed", "#e11d48", "#0891b2"];
+      for (const [index, route] of (args.algorithm_routes || []).entries()) {
+        if (!route.coordinates || route.coordinates.length < 2) continue;
+        const item = document.createElement("span");
+        item.className = "legend-item";
+        item.innerHTML = `<i class="swatch" style="background:${palette[index % palette.length]}"></i>${safeText(route.name)} graph path`;
+        legend.appendChild(item);
+      }
+      const signature = routeSignature(args.origin, args.destination);
+      const googleRoute = routeCache.get(signature);
+      if (googleRoute && googleRoute.type === "google_route") {
+        const item = document.createElement("span");
+        item.className = "legend-item";
+        item.innerHTML = '<i class="swatch" style="background:#1264d8"></i>Google walking route';
+        legend.appendChild(item);
+      }
+      resizeFrame();
+    }
+    function showRouteSummary(route) {
+      const target = $("directions");
+      target.replaceChildren();
+      if (route.type === "google_route") {
+        const summary = document.createElement("div");
+        summary.innerHTML = `<strong>Google walking directions</strong> · ${Math.round(route.distance_m)} m · ${Math.max(1, Math.round(route.duration_ms / 60000))} min`;
+        target.appendChild(summary);
+        if (route.steps && route.steps.length) {
+          const list = document.createElement("ol");
+          list.id = "steps";
+          for (const step of route.steps) { const item = document.createElement("li"); item.textContent = step; list.appendChild(item); }
+          target.appendChild(list);
+        }
+      } else if (route.type === "google_route_error") {
+        target.textContent = route.message;
+      }
+      resizeFrame();
+    }
+
+    async function render(argsFromStreamlit) {
+      args = argsFromStreamlit || {};
+      if (!args.api_key) { setStatus("Google Maps API key is missing."); return; }
+      try {
+        await loadMapsApi(args.api_key);
+        if (!map) await initializeMap();
+        else await renderMapContent();
+      } catch (error) {
+        setStatus(`Google Maps unavailable: ${error.message || "Check the API key and network."}`);
+        $("map").style.display = "none";
+        if (!mapsErrorSent) {
+          mapsErrorSent = true;
+          componentMessage("maps_error", { message: error.message || "Google Maps could not be loaded." });
+        }
+      }
+    }
+
+    $("search").addEventListener("click", searchPlaces);
+    $("query").addEventListener("keydown", (event) => { if (event.key === "Enter") searchPlaces(); });
+    window.addEventListener("message", (event) => {
+      if (!event.data || event.data.type !== "streamlit:render") return;
+      render(event.data.args);
+    });
+    window.parent.postMessage({ isStreamlitMessage: true, type: "streamlit:componentReady", apiVersion: 1 }, "*");
+    resizeFrame();
+  </script>
+</body>
+</html>
