@@ -1,0 +1,21 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "CampusAI · Open website",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "streamlit",
+      "python": "${workspaceFolder}/venv/bin/python",
+      "args": [
+        "run",
+        "${workspaceFolder}/app.py",
+        "--server.headless=false"
+      ],
+      "cwd": "${workspaceFolder}",
+      "console": "internalConsole",
+      "redirectOutput": true,
+      "internalConsoleOptions": "openOnSessionStart"
+    }
+  ]
+}
