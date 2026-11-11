@@ -1,0 +1,15 @@
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+.streamlit/credentials.toml
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+cache/
+database/campus.db
+*.sqlite
+*.sqlite3
+.DS_Store
+data/campus_graph.tmp
